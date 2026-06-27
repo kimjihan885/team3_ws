@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import math
+from collections import deque
 
 import cv2 as cv
 from cv_bridge import CvBridge
@@ -23,16 +24,23 @@ class LaneFollow(Node):
 
         self.declare_parameter('img_width', 640)
         self.declare_parameter('img_height', 480)
-        self.declare_parameter('white_lower', [0, 0, 200])
-        self.declare_parameter('white_upper', [180, 40, 255])
+        self.declare_parameter('white_lower', [0, 0, 180])
+        self.declare_parameter('white_upper', [180, 20, 255])
         self.declare_parameter('debug_view', True)
         self.declare_parameter('process_hz', 30.0)
         self.declare_parameter('steer_k', 0.005)
         self.declare_parameter('yaw_k', 1.0)
-        self.declare_parameter('max_steer', 0.9)
+        self.declare_parameter('max_steer', 0.409)
+        self.declare_parameter('steer_smoothing_alpha', 0.35)
+        self.declare_parameter('steer_slowdown_ratio', 0.35)
+        self.declare_parameter('min_smooth_speed', 0.45)
         self.declare_parameter('lane_width_px', 250.0)
         self.declare_parameter('min_lane_overlap_px', 50.0)
         self.declare_parameter('min_lane_pixels', 30)
+        self.declare_parameter('use_history_lane_fallback', True)
+        self.declare_parameter('lane_history_size', 10)
+        self.declare_parameter('min_lane_history_samples', 3)
+        self.declare_parameter('history_compare_y_ratio', 0.85)
 
         self.img_width = int(self.get_parameter('img_width').value)
         self.img_height = int(self.get_parameter('img_height').value)
@@ -49,11 +57,32 @@ class LaneFollow(Node):
         self.steer_k = float(self.get_parameter('steer_k').value)
         self.yaw_k = float(self.get_parameter('yaw_k').value)
         self.max_steer = float(self.get_parameter('max_steer').value)
+        self.steer_smoothing_alpha = float(
+            self.get_parameter('steer_smoothing_alpha').value
+        )
+        self.steer_slowdown_ratio = float(
+            self.get_parameter('steer_slowdown_ratio').value
+        )
+        self.min_smooth_speed = float(
+            self.get_parameter('min_smooth_speed').value
+        )
         self.lane_width_px = float(self.get_parameter('lane_width_px').value)
         self.min_lane_overlap_px = float(
             self.get_parameter('min_lane_overlap_px').value
         )
         self.min_lane_pixels = int(self.get_parameter('min_lane_pixels').value)
+        self.use_history_lane_fallback = bool(
+            self.get_parameter('use_history_lane_fallback').value
+        )
+        self.lane_history_size = int(
+            self.get_parameter('lane_history_size').value
+        )
+        self.min_lane_history_samples = int(
+            self.get_parameter('min_lane_history_samples').value
+        )
+        self.history_compare_y_ratio = float(
+            self.get_parameter('history_compare_y_ratio').value
+        )
 
         self.image_sub = self.create_subscription(
             CompressedImage,
@@ -61,21 +90,15 @@ class LaneFollow(Node):
             self.image_cb,
             qos_profile_sensor_data,
         )
-        self.mission_sub = self.create_subscription(
-            Float64,
-            '/mission_num',
-            self.mission_cb,
-            10,
-        )
-
-        self.mission_pub = self.create_publisher(Float64, '/mission_num', 10)
         self.cmd_vel_pub = self.create_publisher(
             Twist,
             '/cmd_vel',
             10,
         )
         self.roi_img_pub = self.create_publisher(Image, '/roi_img', 10)
+
         self.binary_img_pub = self.create_publisher(Image, '/binary_img', 10)
+
         self.debug_publisher1 = self.create_publisher(
             Image,
             '/debugging_image1',
@@ -98,8 +121,6 @@ class LaneFollow(Node):
             self.src_points,
         )
 
-        self.start_mission = False
-        self.current_mission = 0.0
         self.bgr = None
         self.warp_img0 = None
         self.warp_img = None
@@ -111,8 +132,12 @@ class LaneFollow(Node):
         self.error = 0.0
         self.steer = 0.0
         self.angular_velocity = 0.0
+        self.prev_steer = None
+        self.cmd_speed = 0.0
         self.prev_lfit = None
         self.prev_rfit = None
+        self.left_fit_history = deque(maxlen=self.lane_history_size)
+        self.right_fit_history = deque(maxlen=self.lane_history_size)
         self.last_lane_status = 'none'
 
         period = 1.0 / process_hz if process_hz > 0.0 else 1.0 / 30.0
@@ -134,8 +159,6 @@ class LaneFollow(Node):
 
         self.bgr = bgr
 
-    def mission_cb(self, msg):
-        self.current_mission = msg.data
 
     def warpping(self, img):
         h, w = img.shape[:2]
@@ -174,6 +197,35 @@ class LaneFollow(Node):
             return 'left'
         return 'right'
 
+    def update_lane_history(self, lfit, rfit):
+        self.left_fit_history.append(np.array(lfit, dtype=float))
+        self.right_fit_history.append(np.array(rfit, dtype=float))
+
+    def detect_lane_side_by_history(self, fit, img_h):
+        if not self.use_history_lane_fallback:
+            return None
+        if len(self.left_fit_history) < self.min_lane_history_samples:
+            return None
+        if len(self.right_fit_history) < self.min_lane_history_samples:
+            return None
+
+        avg_lfit = np.mean(np.array(self.left_fit_history), axis=0)
+        avg_rfit = np.mean(np.array(self.right_fit_history), axis=0)
+        compare_y = (img_h - 1) * self.history_compare_y_ratio
+
+        detected_x = fit[0] * compare_y + fit[1]
+        avg_left_x = avg_lfit[0] * compare_y + avg_lfit[1]
+        avg_right_x = avg_rfit[0] * compare_y + avg_rfit[1]
+
+        left_dist = abs(detected_x - avg_left_x)
+        right_dist = abs(detected_x - avg_right_x)
+
+        if left_dist == right_dist:
+            return None
+        if left_dist < right_dist:
+            return 'left'
+        return 'right'
+
     def roi_set(self, img):
         h = img.shape[0]
         w = img.shape[1]
@@ -190,8 +242,8 @@ class LaneFollow(Node):
             base_speed = 0.25
         else:
             base_speed = 0.35
-        base_speed = 0.9
-        wheelbase = 0.2
+        base_speed = 0.99
+        wheelbase = 0.23
 
         # Stanley 제어기로 조향각 delta 계산
         steering_angle = (
@@ -203,14 +255,35 @@ class LaneFollow(Node):
         )
 
         # LIMO의 등가 중심 조향각 제한
-        max_steering_angle = 0.408  # 약 23.4도
-        steering_angle = float(
+        raw_steering_angle = float(
             np.clip(
                 steering_angle,
-                -max_steering_angle,
-                max_steering_angle,
+                -self.max_steer,
+                self.max_steer,
             )
         )
+
+        if self.prev_steer is None:
+            steering_delta = 0.0
+            steering_angle = raw_steering_angle
+        else:
+            steering_delta = raw_steering_angle - self.prev_steer
+            alpha = float(np.clip(self.steer_smoothing_alpha, 0.0, 1.0))
+            steering_angle = self.prev_steer + alpha * steering_delta
+            steering_angle = float(
+                np.clip(
+                    steering_angle,
+                    -self.max_steer,
+                    self.max_steer,
+                )
+            )
+
+        steer_change_ratio = min(
+            abs(steering_delta) / max(abs(self.max_steer), 0.01),
+            1.0,
+        )
+        speed_scale = 1.0 - self.steer_slowdown_ratio * steer_change_ratio
+        base_speed = max(base_speed * speed_scale, self.min_smooth_speed)
 
         # 조향각을 차체 각속도로 변환
         angular_velocity = (
@@ -218,6 +291,8 @@ class LaneFollow(Node):
         )
 
         self.steer = steering_angle
+        self.prev_steer = steering_angle
+        self.cmd_speed = float(base_speed)
         self.angular_velocity = float(angular_velocity)
 
         msg = Twist()
@@ -323,38 +398,57 @@ class LaneFollow(Node):
             else:
                 self.prev_lfit = lfit.copy()
                 self.prev_rfit = rfit.copy()
+                self.update_lane_history(lfit, rfit)
 
         elif left_detected:
-            original_side = self.detect_original_bottom_lane_side()
+            history_side = self.detect_lane_side_by_history(lfit, y)
+            original_side = (
+                history_side
+                if history_side is not None
+                else self.detect_original_bottom_lane_side()
+            )
 
-            # 오른쪽 차선이 보이지 않으면 왼쪽 차선과 같은 기울기를 유지하면서
-            # 추정된(또는 기본) 차선 폭(self.lane_width_px)만큼 평행 이동해
-            # 가상 오른쪽 차선을 만든다. 화면 가장자리에 고정하면 곡선 구간이나
-            # 차량이 한쪽으로 치우친 상황에서 차선 폭이 비현실적으로 커지거나
-            # 작아져 중심선 추정이 왜곡되므로, 화면 끝 대신 lane_width_px를
-            # 사용한다.
+            # 오른쪽 차선이 보이지 않으면 왼쪽 차선과 같은 기울기를
+            # 유지하면서 lane_width_px만큼 평행 이동해 가상 오른쪽
+            # 차선을 만든다.
             if original_side == 'right':
-                self.last_lane_status = 'origin_right_only'
+                if history_side == 'right':
+                    self.last_lane_status = 'history_right_only'
+                else:
+                    self.last_lane_status = 'origin_right_only'
                 rfit = lfit.copy()
                 lfit = np.array([rfit[0], rfit[1] - self.lane_width_px])
             else:
-                if original_side == 'left':
+                if history_side == 'left':
+                    self.last_lane_status = 'history_left_only'
+                elif original_side == 'left':
                     self.last_lane_status = 'origin_left_only'
                 else:
                     self.last_lane_status = 'left_only'
                 rfit = np.array([lfit[0], lfit[1] + self.lane_width_px])
 
         elif right_detected:
-            original_side = self.detect_original_bottom_lane_side()
+            history_side = self.detect_lane_side_by_history(rfit, y)
+            original_side = (
+                history_side
+                if history_side is not None
+                else self.detect_original_bottom_lane_side()
+            )
 
-            # 왼쪽 차선이 보이지 않으면 오른쪽 차선과 같은 기울기를 유지하면서
-            # lane_width_px만큼 평행 이동해 가상 왼쪽 차선을 만든다.
+            # 왼쪽 차선이 보이지 않으면 오른쪽 차선과 같은 기울기를
+            # 유지하면서 lane_width_px만큼 평행 이동해 가상 왼쪽 차선을
+            # 만든다.
             if original_side == 'left':
-                self.last_lane_status = 'origin_left_only'
+                if history_side == 'left':
+                    self.last_lane_status = 'history_left_only'
+                else:
+                    self.last_lane_status = 'origin_left_only'
                 lfit = rfit.copy()
                 rfit = np.array([lfit[0], lfit[1] + self.lane_width_px])
             else:
-                if original_side == 'right':
+                if history_side == 'right':
+                    self.last_lane_status = 'history_right_only'
+                elif original_side == 'right':
                     self.last_lane_status = 'origin_right_only'
                 else:
                     self.last_lane_status = 'right_only'
@@ -472,7 +566,7 @@ class LaneFollow(Node):
             f'yaw: {self.yaw:.3f} rad / steer: {steer_deg:.1f} deg '
             f'/ ang_z: {self.angular_velocity:.2f}'
         )
-        text2 = f'err: {self.error:.1f} px'
+        text2 = f'err: {self.error:.1f} px / v: {self.cmd_speed:.2f}'
         text3 = f'lane: {self.last_lane_status}'
         cv.putText(result, text1, (30, 40),
                    cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv.LINE_AA)
@@ -488,14 +582,7 @@ class LaneFollow(Node):
         return result
 
     def process(self):
-        if not self.start_mission:
-            self.get_logger().info(
-                'mission start!!! / Lane Following is always working...'
-            )
-            self.start_mission = True
-            msg = Float64()
-            msg.data = 1.0
-            self.mission_pub.publish(msg)
+ 
 
         if self.bgr is None:
             return
@@ -508,7 +595,6 @@ class LaneFollow(Node):
             self.cv_bridge.cv2_to_imgmsg(g_filtered, encoding='bgr8')
         )
 
-        self.gear = 3
         self.white_img = self.white_color_filter_hsv(g_filtered)
         self.filtered_img = self.binary_filter(self.white_img)
         self.binary_img_pub.publish(
@@ -544,6 +630,9 @@ def main(args=None):
     node = LaneFollow()
 
     try:
+        node.get_logger().info(
+        'mission start!!! / Lane Following is always working...'
+         )
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info('Interrupted by user')
