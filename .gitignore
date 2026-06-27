@@ -1,0 +1,19 @@
+# ROS 2 workspace build artifacts
+build/
+install/
+log/
+
+# Local datasets and generated images
+my_bag/
+raw_image/output_images/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
