@@ -28,9 +28,9 @@ class LaneFollow(Node):
         self.declare_parameter('white_upper', [180, 20, 255])
         self.declare_parameter('debug_view', True)
         self.declare_parameter('process_hz', 30.0)
-        self.declare_parameter('steer_k', 0.005)
+        self.declare_parameter('steer_k', 0.002)
         self.declare_parameter('yaw_k', 1.0)
-        self.declare_parameter('max_steer', 0.409)
+        self.declare_parameter('max_steer', 0.6)
         self.declare_parameter('steer_smoothing_alpha', 0.35)
         self.declare_parameter('steer_slowdown_ratio', 0.35)
         self.declare_parameter('min_smooth_speed', 0.45)
@@ -41,6 +41,12 @@ class LaneFollow(Node):
         self.declare_parameter('lane_history_size', 10)
         self.declare_parameter('min_lane_history_samples', 3)
         self.declare_parameter('history_compare_y_ratio', 0.85)
+        self.declare_parameter('single_lane_track_alpha', 0.80)
+        self.declare_parameter('side_match_gate_ratio', 0.60)
+        self.declare_parameter('side_match_margin_ratio', 0.12)
+        self.declare_parameter('lane_width_update_alpha', 0.10)
+        self.declare_parameter('side_switch_frames', 3)
+        self.declare_parameter('side_hold_gate_ratio', 0.85)
 
         self.img_width = int(self.get_parameter('img_width').value)
         self.img_height = int(self.get_parameter('img_height').value)
@@ -82,6 +88,25 @@ class LaneFollow(Node):
         )
         self.history_compare_y_ratio = float(
             self.get_parameter('history_compare_y_ratio').value
+        )
+        self.single_lane_track_alpha = float(
+            self.get_parameter('single_lane_track_alpha').value
+        )
+        self.side_match_gate_ratio = float(
+            self.get_parameter('side_match_gate_ratio').value
+        )
+        self.side_match_margin_ratio = float(
+            self.get_parameter('side_match_margin_ratio').value
+        )
+        self.lane_width_update_alpha = float(
+            self.get_parameter('lane_width_update_alpha').value
+        )
+        self.side_switch_frames = max(
+            1,
+            int(self.get_parameter('side_switch_frames').value),
+        )
+        self.side_hold_gate_ratio = float(
+            self.get_parameter('side_hold_gate_ratio').value
         )
 
         self.image_sub = self.create_subscription(
@@ -139,6 +164,11 @@ class LaneFollow(Node):
         self.left_fit_history = deque(maxlen=self.lane_history_size)
         self.right_fit_history = deque(maxlen=self.lane_history_size)
         self.last_lane_status = 'none'
+        self.last_observed_side = None
+        self.pending_single_side = None
+        self.pending_single_count = 0
+        self.single_left_score = float('inf')
+        self.single_right_score = float('inf')
 
         period = 1.0 / process_hz if process_hz > 0.0 else 1.0 / 30.0
         self.timer = self.create_timer(period, self.process)
@@ -177,54 +207,161 @@ class LaneFollow(Node):
         _, binary = cv.threshold(gray, 100, 255, cv.THRESH_BINARY)
         return binary
 
-    def detect_original_bottom_lane_side(self):
-        if self.bgr is None:
-            return None
-
-        white_img = self.white_color_filter_hsv(self.bgr)
-        gray = cv.cvtColor(white_img, cv.COLOR_BGR2GRAY)
-
-        h, w = gray.shape[:2]
-        bottom_roi = gray[int(h * 0.85):h, :]
-        midpoint = w // 2
-
-        left_count = cv.countNonZero(bottom_roi[:, :midpoint])
-        right_count = cv.countNonZero(bottom_roi[:, midpoint:])
-
-        if left_count == right_count:
-            return None
-        if left_count > right_count:
-            return 'left'
-        return 'right'
-
     def update_lane_history(self, lfit, rfit):
         self.left_fit_history.append(np.array(lfit, dtype=float))
         self.right_fit_history.append(np.array(rfit, dtype=float))
 
-    def detect_lane_side_by_history(self, fit, img_h):
-        if not self.use_history_lane_fallback:
-            return None
-        if len(self.left_fit_history) < self.min_lane_history_samples:
-            return None
-        if len(self.right_fit_history) < self.min_lane_history_samples:
-            return None
+    @staticmethod
+    def fit_x(fit, y_values):
+        y_values = np.asarray(y_values, dtype=float)
+        return fit[0] * y_values + fit[1]
 
-        avg_lfit = np.mean(np.array(self.left_fit_history), axis=0)
-        avg_rfit = np.mean(np.array(self.right_fit_history), axis=0)
-        compare_y = (img_h - 1) * self.history_compare_y_ratio
+    def fit_distance(self, fit_a, fit_b, img_h):
+        """여러 높이에서 두 차선 모델 사이의 대표 픽셀 거리."""
+        y_values = (img_h - 1) * np.array([0.15, 0.35, 0.55, 0.75, 0.95])
+        distance = np.abs(
+            self.fit_x(fit_a, y_values)
+            - self.fit_x(fit_b, y_values)
+        )
+        return float(np.median(distance))
 
-        detected_x = fit[0] * compare_y + fit[1]
-        avg_left_x = avg_lfit[0] * compare_y + avg_lfit[1]
-        avg_right_x = avg_rfit[0] * compare_y + avg_rfit[1]
+    def classify_single_lane(self, fit, img_h):
+        """한 개의 검출선을 이전 좌/우 경계 모델에 연결한다.
 
-        left_dist = abs(detected_x - avg_left_x)
-        right_dist = abs(detected_x - avg_right_x)
+        Sliding Window가 어느 화면 절반에서 시작했는지는 사용하지 않는다.
+        현재 검출선과 이전 left/right 모델의 여러 높이에서의 거리와
+        기울기 차이를 계산하고, 시간적 히스테리시스로 한 프레임의
+        오판정이 즉시 좌우 반전으로 이어지지 않게 한다.
+        """
+        if self.prev_lfit is None or self.prev_rfit is None:
+            self.single_left_score = float('inf')
+            self.single_right_score = float('inf')
+            return None, self.single_left_score, self.single_right_score
 
-        if left_dist == right_dist:
-            return None
-        if left_dist < right_dist:
-            return 'left'
-        return 'right'
+        left_score = self.fit_distance(fit, self.prev_lfit, img_h)
+        right_score = self.fit_distance(fit, self.prev_rfit, img_h)
+
+        # 동일한 위치라도 기울기가 크게 다르면 같은 경계일 가능성을 낮춘다.
+        slope_weight = 0.20 * img_h
+        left_score += slope_weight * abs(fit[0] - self.prev_lfit[0])
+        right_score += slope_weight * abs(fit[0] - self.prev_rfit[0])
+
+        self.single_left_score = float(left_score)
+        self.single_right_score = float(right_score)
+
+        lane_width = max(abs(self.lane_width_px), 1.0)
+        match_gate = max(35.0, self.side_match_gate_ratio * lane_width)
+        hold_gate = max(match_gate, self.side_hold_gate_ratio * lane_width)
+        decision_margin = max(12.0, self.side_match_margin_ratio * lane_width)
+
+        best_score = min(left_score, right_score)
+        score_gap = abs(left_score - right_score)
+
+        if best_score > match_gate or score_gap < decision_margin:
+            raw_side = None
+        elif left_score < right_score:
+            raw_side = 'left'
+        else:
+            raw_side = 'right'
+
+        # 아직 단일 차선의 추적 ID가 없으면 강한 첫 판정을 그대로 사용한다.
+        if self.last_observed_side is None:
+            if raw_side is not None:
+                self.last_observed_side = raw_side
+                self.pending_single_side = None
+                self.pending_single_count = 0
+            return raw_side, left_score, right_score
+
+        current_side = self.last_observed_side
+        current_score = left_score if current_side == 'left' else right_score
+
+        # 애매한 프레임에서는 현재 추적 ID가 허용 거리 안에 있을 때 유지한다.
+        if raw_side is None:
+            self.pending_single_side = None
+            self.pending_single_count = 0
+            if current_score <= hold_gate:
+                return current_side, left_score, right_score
+            return None, left_score, right_score
+
+        # 기존 ID와 같은 판정이면 즉시 유지하고 전환 후보를 초기화한다.
+        if raw_side == current_side:
+            self.pending_single_side = None
+            self.pending_single_count = 0
+            return current_side, left_score, right_score
+
+        # 반대쪽 판정은 여러 프레임 연속 확인된 뒤에만 실제 ID를 변경한다.
+        if self.pending_single_side == raw_side:
+            self.pending_single_count += 1
+        else:
+            self.pending_single_side = raw_side
+            self.pending_single_count = 1
+
+        if self.pending_single_count >= self.side_switch_frames:
+            self.last_observed_side = raw_side
+            self.pending_single_side = None
+            self.pending_single_count = 0
+            return raw_side, left_score, right_score
+
+        # 전환 확인 중에는 기존 경계를 계속 추적한다. 기존 모델과 너무 멀면
+        # 억지로 사용하지 않고 ambiguous로 처리한다.
+        if current_score <= hold_gate:
+            return current_side, left_score, right_score
+        return None, left_score, right_score
+
+    def update_single_lane_track(self, observed_fit, side):
+        """관측된 경계는 추적하고, 반대 경계만 고정 차선 폭으로 복원한다."""
+        alpha = float(np.clip(self.single_lane_track_alpha, 0.0, 1.0))
+        observed_fit = np.asarray(observed_fit, dtype=float)
+
+        if side == 'left':
+            if self.prev_lfit is None:
+                tracked = observed_fit.copy()
+            else:
+                tracked = (
+                    alpha * observed_fit
+                    + (1.0 - alpha) * self.prev_lfit
+                )
+            lfit = tracked
+            rfit = np.array([tracked[0], tracked[1] + self.lane_width_px])
+        else:
+            if self.prev_rfit is None:
+                tracked = observed_fit.copy()
+            else:
+                tracked = (
+                    alpha * observed_fit
+                    + (1.0 - alpha) * self.prev_rfit
+                )
+            rfit = tracked
+            lfit = np.array([tracked[0], tracked[1] - self.lane_width_px])
+
+        # 단일 차선 구간에서도 추적 기준을 현재 프레임으로 이동시킨다.
+        # 차선 폭 자체는 양쪽 차선이 실제로 보일 때만 갱신한다.
+        self.prev_lfit = lfit.copy()
+        self.prev_rfit = rfit.copy()
+        self.last_observed_side = side
+        return lfit, rfit
+
+    def update_both_lane_track(self, lfit, rfit, img_h, img_w):
+        """양쪽 차선이 보일 때 좌우 순서와 차선 폭 추적값을 갱신한다."""
+        y_values = (img_h - 1) * np.array([0.25, 0.50, 0.75, 0.95])
+        left_x = self.fit_x(lfit, y_values)
+        right_x = self.fit_x(rfit, y_values)
+        widths = right_x - left_x
+        measured_width = float(np.median(widths))
+
+        if self.min_lane_overlap_px <= measured_width <= img_w * 0.85:
+            alpha = float(np.clip(self.lane_width_update_alpha, 0.0, 1.0))
+            self.lane_width_px = (
+                (1.0 - alpha) * self.lane_width_px
+                + alpha * measured_width
+            )
+
+        self.prev_lfit = np.asarray(lfit, dtype=float).copy()
+        self.prev_rfit = np.asarray(rfit, dtype=float).copy()
+        self.update_lane_history(lfit, rfit)
+        self.last_observed_side = None
+        self.pending_single_side = None
+        self.pending_single_count = 0
 
     def roi_set(self, img):
         h = img.shape[0]
@@ -233,16 +370,8 @@ class LaneFollow(Node):
 
     def cal_steering(self, yaw, error, gear=3):
         gear = self.gear
-
-        if gear == 3:
-            base_speed = 0.35
-        elif gear == 2:
-            base_speed = 0.55
-        elif gear == 1:
-            base_speed = 0.25
-        else:
-            base_speed = 0.35
-        base_speed = 0.99
+        
+        base_speed = 0.7
         wheelbase = 0.23
 
         # Stanley 제어기로 조향각 delta 계산
@@ -369,90 +498,82 @@ class LaneFollow(Node):
                 1,
             )
 
-        # NOTE: prev_lfit / prev_rfit는 "양쪽 차선이 실제로 검출된 경우"에만
-        # 갱신한다. left_only / right_only / default 분기에서 만들어진 가상
-        # 차선을 prev_*에 저장하면, 다음 프레임에서 양쪽 다 안 보일 때
-        # (previous 분기) 왜곡된 추정값이 그대로 재사용되어 오차가 누적된다.
-        if left_detected and right_detected:
-            self.last_lane_status = 'both'
-            y_bottom = y - 1
-            left_x = lfit[0] * y_bottom + lfit[1]
-            right_x = rfit[0] * y_bottom + rfit[1]
-            lane_width = abs(right_x - left_x)
+        # left/right 윈도우 이름은 화면 절반에서 시작한 검출기 이름일 뿐이다.
+        # 여기서는 검출 결과를 후보로 모은 뒤 의미상 좌/우를 다시 배정한다.
+        candidates = []
+        if left_detected:
+            candidates.append((lfit, len(left_lane_inds), 'window_left'))
+        if right_detected:
+            candidates.append((rfit, len(right_lane_inds), 'window_right'))
 
-            if lane_width < self.min_lane_overlap_px:
-                bottom_y = int(y * 0.7)
-                left_bottom_count = np.count_nonzero(
-                    nz[0][left_lane_inds] >= bottom_y
-                )
-                right_bottom_count = np.count_nonzero(
-                    nz[0][right_lane_inds] >= bottom_y
-                )
+        # 두 윈도우가 같은 흰 선을 중복 추적했으면 픽셀이 많은 후보만 남긴다.
+        if len(candidates) == 2:
+            duplicate_distance = self.fit_distance(
+                candidates[0][0],
+                candidates[1][0],
+                y,
+            )
+            if duplicate_distance < self.min_lane_overlap_px:
+                candidates = [max(candidates, key=lambda item: item[1])]
 
-                if left_bottom_count >= right_bottom_count:
-                    self.last_lane_status = 'overlap_left_only'
-                    rfit = np.array([lfit[0], lfit[1] + self.lane_width_px])
-                else:
-                    self.last_lane_status = 'overlap_right_only'
-                    lfit = np.array([rfit[0], rfit[1] - self.lane_width_px])
+        if len(candidates) == 2:
+            fit_a = np.asarray(candidates[0][0], dtype=float)
+            fit_b = np.asarray(candidates[1][0], dtype=float)
+            compare_y = (y - 1) * 0.80
+
+            # 같은 높이에서 x가 작은 경계를 의미상 왼쪽 차선으로 둔다.
+            if self.fit_x(fit_a, [compare_y])[0] <= self.fit_x(fit_b, [compare_y])[0]:
+                lfit, rfit = fit_a, fit_b
             else:
-                self.prev_lfit = lfit.copy()
-                self.prev_rfit = rfit.copy()
-                self.update_lane_history(lfit, rfit)
+                lfit, rfit = fit_b, fit_a
 
-        elif left_detected:
-            history_side = self.detect_lane_side_by_history(lfit, y)
-            original_side = (
-                history_side
-                if history_side is not None
-                else self.detect_original_bottom_lane_side()
+            lane_width = self.fit_distance(lfit, rfit, y)
+            if lane_width >= self.min_lane_overlap_px:
+                self.last_lane_status = 'both'
+                self.update_both_lane_track(lfit, rfit, y, img.shape[1])
+            else:
+                # 사실상 한 선을 두 번 잡은 경우
+                candidate = max(candidates, key=lambda item: item[1])[0]
+                side, left_score, right_score = self.classify_single_lane(
+                    candidate,
+                    y,
+                )
+                if side is None:
+                    self.last_lane_status = 'single_ambiguous'
+                    if self.prev_lfit is not None and self.prev_rfit is not None:
+                        lfit = self.prev_lfit.copy()
+                        rfit = self.prev_rfit.copy()
+                    else:
+                        lane_center = img.shape[1] / 2.0
+                        half_lane = self.lane_width_px / 2.0
+                        lfit = np.array([0.0, lane_center - half_lane])
+                        rfit = np.array([0.0, lane_center + half_lane])
+                else:
+                    lfit, rfit = self.update_single_lane_track(candidate, side)
+                    self.last_lane_status = f'tracked_{side}_only'
+
+        elif len(candidates) == 1:
+            candidate = np.asarray(candidates[0][0], dtype=float)
+            side, left_score, right_score = self.classify_single_lane(
+                candidate,
+                y,
             )
 
-            # 오른쪽 차선이 보이지 않으면 왼쪽 차선과 같은 기울기를
-            # 유지하면서 lane_width_px만큼 평행 이동해 가상 오른쪽
-            # 차선을 만든다.
-            if original_side == 'right':
-                if history_side == 'right':
-                    self.last_lane_status = 'history_right_only'
+            if side is None:
+                # 한 프레임의 선 위치만으로는 좌/우를 확정할 수 없다.
+                # 잘못 뒤집기보다 마지막 추적 모델을 잠시 유지한다.
+                self.last_lane_status = 'single_ambiguous'
+                if self.prev_lfit is not None and self.prev_rfit is not None:
+                    lfit = self.prev_lfit.copy()
+                    rfit = self.prev_rfit.copy()
                 else:
-                    self.last_lane_status = 'origin_right_only'
-                rfit = lfit.copy()
-                lfit = np.array([rfit[0], rfit[1] - self.lane_width_px])
+                    lane_center = img.shape[1] / 2.0
+                    half_lane = self.lane_width_px / 2.0
+                    lfit = np.array([0.0, lane_center - half_lane])
+                    rfit = np.array([0.0, lane_center + half_lane])
             else:
-                if history_side == 'left':
-                    self.last_lane_status = 'history_left_only'
-                elif original_side == 'left':
-                    self.last_lane_status = 'origin_left_only'
-                else:
-                    self.last_lane_status = 'left_only'
-                rfit = np.array([lfit[0], lfit[1] + self.lane_width_px])
-
-        elif right_detected:
-            history_side = self.detect_lane_side_by_history(rfit, y)
-            original_side = (
-                history_side
-                if history_side is not None
-                else self.detect_original_bottom_lane_side()
-            )
-
-            # 왼쪽 차선이 보이지 않으면 오른쪽 차선과 같은 기울기를
-            # 유지하면서 lane_width_px만큼 평행 이동해 가상 왼쪽 차선을
-            # 만든다.
-            if original_side == 'left':
-                if history_side == 'left':
-                    self.last_lane_status = 'history_left_only'
-                else:
-                    self.last_lane_status = 'origin_left_only'
-                lfit = rfit.copy()
-                rfit = np.array([lfit[0], lfit[1] + self.lane_width_px])
-            else:
-                if history_side == 'right':
-                    self.last_lane_status = 'history_right_only'
-                elif original_side == 'right':
-                    self.last_lane_status = 'origin_right_only'
-                else:
-                    self.last_lane_status = 'right_only'
-                lfit = np.array([rfit[0], rfit[1] - self.lane_width_px])
+                lfit, rfit = self.update_single_lane_track(candidate, side)
+                self.last_lane_status = f'tracked_{side}_only'
 
         elif self.prev_lfit is not None and self.prev_rfit is not None:
             self.last_lane_status = 'previous'
@@ -568,6 +689,13 @@ class LaneFollow(Node):
         )
         text2 = f'err: {self.error:.1f} px / v: {self.cmd_speed:.2f}'
         text3 = f'lane: {self.last_lane_status}'
+        if np.isfinite(self.single_left_score) and np.isfinite(self.single_right_score):
+            text4 = (
+                f'match L:{self.single_left_score:.1f} '
+                f'R:{self.single_right_score:.1f}'
+            )
+        else:
+            text4 = 'match L:- R:-'
         cv.putText(result, text1, (30, 40),
                    cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv.LINE_AA)
         cv.putText(result, text2, (30, 110),
