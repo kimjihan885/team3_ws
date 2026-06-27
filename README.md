@@ -1,161 +1,90 @@
-# Songdo Mission ROS 2 Workspace
+# team3_ws
 
-ROS 2 Python workspace for camera-based lane following and bird-eye calibration.
-The main package, `songdo_mission`, detects white lane markings from a compressed
-RGB camera stream, estimates a lane/center line in a warped ROI, and publishes
-velocity commands for a mobile robot.
+ROS 2 workspace for the Songdo mission robot code.
 
-## Repository Layout
+The current focus is `pre_lane_follow`, a camera-based lane following node for
+detecting white lane markings, estimating a drivable line, and publishing
+`/cmd_vel`.
+
+## Package
 
 ```text
-team3_ws/
-├── src/songdo_mission/
-│   ├── songdo_mission/
-│   │   ├── pre_lane_follow.py       # Lane detection and steering node
-│   │   └── bird_eye_calibrator.py   # Interactive perspective calibration tool
-│   ├── package.xml
-│   └── setup.py
-├── raw_image/image_extractor.py     # Utility script for extracting bag images
-├── best.pt                          # Local model artifact kept with the project
-└── .gitignore
+src/songdo_mission/
+├── songdo_mission/
+│   ├── pre_lane_follow.py       # Main lane-following node
+│   └── bird_eye_calibrator.py   # Bird-eye calibration helper
+├── package.xml
+└── setup.py
 ```
 
-Generated ROS workspace outputs and local datasets are intentionally ignored:
-`build/`, `install/`, `log/`, `my_bag/`, `raw_image/output_images/`, and Python
-cache directories.
+## pre_lane_follow Structure
 
-## Nodes
+`pre_lane_follow.py` is organized as a simple vision-to-control pipeline:
 
-### `pre_lane_follow`
+1. Subscribe to the compressed camera image.
+2. Resize the frame to the configured image size.
+3. Warp the image into a bird-eye view.
+4. Crop the lower ROI used for lane tracking.
+5. Filter white lane markings in HSV.
+6. Convert the filtered image to a binary mask.
+7. Detect lane pixels with a sliding-window search.
+8. Fit left/right lane lines.
+9. Handle one-lane or overlapping-lane cases with fallback heuristics.
+10. Compute yaw and lateral error from the estimated center line.
+11. Convert the steering result into a `Twist` command.
+12. Publish debug images for ROI, binary mask, sliding windows, and final overlay.
 
-Lane-following node with:
+The node is still being tuned, so the heuristics in `pre_lane_follow.py` are
+expected to change as camera calibration and driving behavior improve.
 
-- Bird-eye perspective transform
-- HSV white lane filtering
-- Binary thresholding
-- Sliding-window line fitting
-- One-lane fallback using fixed lane-width heuristics
-- Stanley-style steering-angle calculation converted to `cmd_vel.angular.z`
-- Debug overlays for ROI windows, fitted lines, lane status, error, steering, and angular velocity
+## Main Topics
 
-Run:
+Input:
 
-```bash
-ros2 run songdo_mission pre_lane_follow
-```
+- `/camera/color/image_raw/compressed`
 
-Subscribed topics:
+Output:
 
-| Topic | Type | Purpose |
-| --- | --- | --- |
-| `/camera/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | Input camera image |
-| `/mission_num` | `std_msgs/msg/Float64` | Mission state input |
+- `/cmd_vel`
+- `/roi_img`
+- `/binary_img`
+- `/debugging_image1`
+- `/debugging_image2`
 
-Published topics:
-
-| Topic | Type | Purpose |
-| --- | --- | --- |
-| `/cmd_vel` | `geometry_msgs/msg/Twist` | Robot velocity command |
-| `/mission_num` | `std_msgs/msg/Float64` | Mission state output |
-| `/roi_img` | `sensor_msgs/msg/Image` | Warped ROI image |
-| `/binary_img` | `sensor_msgs/msg/Image` | Binary lane mask |
-| `/debugging_image1` | `sensor_msgs/msg/Image` | Sliding-window debug view |
-| `/debugging_image2` | `sensor_msgs/msg/Image` | Final lane overlay debug view |
-
-Key parameters:
-
-| Parameter | Default | Description |
-| --- | ---: | --- |
-| `img_width` | `640` | Camera image width |
-| `img_height` | `480` | Camera image height |
-| `white_lower` | `[0, 0, 200]` | HSV lower bound for white filtering |
-| `white_upper` | `[180, 40, 255]` | HSV upper bound for white filtering |
-| `process_hz` | `30.0` | Processing loop frequency |
-| `steer_k` | `0.005` | Stanley cross-track gain |
-| `yaw_k` | `1.0` | Heading gain |
-| `max_steer` | `0.9` | Maximum angular command parameter |
-| `lane_width_px` | `250.0` | Fixed lane-width heuristic in warped pixels |
-| `min_lane_overlap_px` | `50.0` | Overlap threshold for duplicate lane fits |
-| `min_lane_pixels` | `30` | Minimum pixels required for a lane detection |
-
-### `bird_eye_calibrator`
-
-Interactive calibration helper for selecting four source points and printing
-`pre_lane_follow.py`-ready `src_points` and `dst_points`.
-
-Run:
-
-```bash
-ros2 run songdo_mission bird_eye_calibrator
-```
-
-Controls:
-
-| Input | Action |
-| --- | --- |
-| Left mouse click | Add points in `LT`, `RT`, `LB`, `RB` order |
-| `u` | Undo last point |
-| `r` | Reset points |
-| `p` | Print current calibration points |
-| `q` or `Esc` | Quit |
-
-## Build
-
-From the workspace root:
+## Build and Run
 
 ```bash
 cd ~/team3_ws
 colcon build --symlink-install
 source install/setup.bash
+ros2 run songdo_mission pre_lane_follow
 ```
 
-Run tests:
+## Bird-eye Calibration
+
+Use the calibrator when the camera angle or perspective points need adjustment:
 
 ```bash
-colcon test
-colcon test-result --verbose
+ros2 run songdo_mission bird_eye_calibrator
 ```
 
-## Typical Workflow
+Click four source points in this order:
 
-1. Calibrate the bird-eye transform:
+```text
+LT, RT, LB, RB
+```
 
-   ```bash
-   ros2 run songdo_mission bird_eye_calibrator
-   ```
+Useful keys:
 
-2. Copy the printed `src_points` / `dst_points` into `pre_lane_follow.py`.
+- `u`: undo
+- `r`: reset
+- `p`: print points
+- `q` or `Esc`: quit
 
-3. Rebuild and source:
+Copy the printed `src_points` and `dst_points` into `pre_lane_follow.py`.
 
-   ```bash
-   colcon build --symlink-install
-   source install/setup.bash
-   ```
+## Git Notes
 
-4. Start lane following:
-
-   ```bash
-   ros2 run songdo_mission pre_lane_follow
-   ```
-
-5. Inspect debug topics in `rqt_image_view`:
-
-   ```bash
-   rqt_image_view
-   ```
-
-Recommended views:
-
-- `/debugging_image1` for sliding-window and fitted-line diagnostics
-- `/debugging_image2` for final overlay and steering text
-- `/binary_img` for white-threshold tuning
-
-## Notes
-
-- The node assumes a white lane/line target and uses HSV thresholding before
-  fitting lines.
-- `lane_width_px` is a fixed heuristic. It is not updated at runtime.
-- One-lane cases are resolved with a combination of bird-eye fitting and original
-  image bottom-region white-pixel checks.
-- Large local bags and extracted image sequences are not tracked in git.
+The repository tracks source code and lightweight project files. Local runtime
+artifacts such as ROS build outputs, logs, bags, extracted images, and Python
+cache files are ignored.
