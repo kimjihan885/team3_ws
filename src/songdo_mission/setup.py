@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'pre_lane_follow2 = songdo_mission.pre_lane_follow2:main',
             'pre_lane_follow = songdo_mission.pre_lane_follow:main',
             'bird_eye_calibrator = songdo_mission.bird_eye_calibrator:main',
         ],
