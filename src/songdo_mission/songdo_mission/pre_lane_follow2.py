@@ -397,13 +397,14 @@ class LaneFollow(Node):
         self.pending_single_count = 0
 
     def roi_set(self, img):
-        # 참고 코드 CUTTING_IDX = 300 기준
-        return img[self.cutting_idx:self.img_height, :]
+        h = img.shape[0]
+        w = img.shape[1]
+        return img[int(h*0.8):h, :]
 
     def cal_steering(self, yaw, error, gear=3):
         gear = self.gear
 
-        base_speed = 0.7
+        base_speed = 1.0
         wheelbase = 0.23
 
         steering_angle = (

@@ -35,7 +35,7 @@ class LaneFollow(Node):
         self.declare_parameter('steer_smoothing_alpha', 0.35)
         self.declare_parameter('steer_slowdown_ratio', 0.35)
         self.declare_parameter('min_smooth_speed', 0.45)
-        self.declare_parameter('lane_width_px', 270.0)
+        self.declare_parameter('lane_width_px', 250.0)
         self.declare_parameter('min_lane_overlap_px', 50.0)
         self.declare_parameter('min_lane_pixels', 30)
         self.declare_parameter('use_history_lane_fallback', True)
