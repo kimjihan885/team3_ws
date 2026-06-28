@@ -26,6 +26,9 @@ setup(
         'console_scripts': [
             'pre_lane_follow2 = songdo_mission.pre_lane_follow2:main',
             'pre_lane_follow = songdo_mission.pre_lane_follow:main',
+            'yolo_lane_follow = songdo_mission.yolo_lane_follow:main',
+            'yolo_lane_follow2 = songdo_mission.yolo_lane_follow2:main',
+            'yolo_cv_follow = songdo_mission.yolo_cv_follow:main',
             'bird_eye_calibrator = songdo_mission.bird_eye_calibrator:main',
         ],
     },

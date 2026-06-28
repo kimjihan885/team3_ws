@@ -17,15 +17,16 @@ from std_msgs.msg import Float64
 
 
 class LaneFollow(Node):
-    def __init__(self):
-        super().__init__('lane_follow')
+    def __init__(self, node_name='lane_follow', start_timer=True):
+        super().__init__(node_name)
 
         self.cv_bridge = CvBridge()
 
         self.declare_parameter('img_width', 640)
         self.declare_parameter('img_height', 480)
         self.declare_parameter('white_lower', [0, 0, 180])
-        self.declare_parameter('white_upper', [180, 20, 255])
+        self.declare_parameter('white_upper', [180, 40, 255])
+
         self.declare_parameter('debug_view', True)
         self.declare_parameter('process_hz', 30.0)
         self.declare_parameter('steer_k', 0.002)
@@ -34,7 +35,7 @@ class LaneFollow(Node):
         self.declare_parameter('steer_smoothing_alpha', 0.35)
         self.declare_parameter('steer_slowdown_ratio', 0.35)
         self.declare_parameter('min_smooth_speed', 0.45)
-        self.declare_parameter('lane_width_px', 250.0)
+        self.declare_parameter('lane_width_px', 270.0)
         self.declare_parameter('min_lane_overlap_px', 50.0)
         self.declare_parameter('min_lane_pixels', 30)
         self.declare_parameter('use_history_lane_fallback', True)
@@ -59,7 +60,7 @@ class LaneFollow(Node):
             dtype=np.uint8,
         )
         self.debug_view = bool(self.get_parameter('debug_view').value)
-        process_hz = float(self.get_parameter('process_hz').value)
+        self.process_hz = float(self.get_parameter('process_hz').value)
         self.steer_k = float(self.get_parameter('steer_k').value)
         self.yaw_k = float(self.get_parameter('yaw_k').value)
         self.max_steer = float(self.get_parameter('max_steer').value)
@@ -169,10 +170,23 @@ class LaneFollow(Node):
         self.pending_single_count = 0
         self.single_left_score = float('inf')
         self.single_right_score = float('inf')
+        self.single_lane_slope = float('nan')
 
-        period = 1.0 / process_hz if process_hz > 0.0 else 1.0 / 30.0
+        self.timer = None
+        if start_timer:
+            self.start_process_timer()
+        self.get_logger().info(f'ROS2 {self.get_name()} node initialized')
+
+    def start_process_timer(self):
+        if self.timer is not None:
+            return
+
+        period = (
+            1.0 / self.process_hz
+            if self.process_hz > 0.0
+            else 1.0 / 30.0
+        )
         self.timer = self.create_timer(period, self.process)
-        self.get_logger().info('ROS2 lane_follow node initialized')
 
     def image_cb(self, image_msg):
         try:
@@ -226,87 +240,25 @@ class LaneFollow(Node):
         return float(np.median(distance))
 
     def classify_single_lane(self, fit, img_h):
-        """한 개의 검출선을 이전 좌/우 경계 모델에 연결한다.
+        """한 개 검출선의 기울기 부호만으로 좌/우 차선을 판단한다."""
+        del img_h
 
-        Sliding Window가 어느 화면 절반에서 시작했는지는 사용하지 않는다.
-        현재 검출선과 이전 left/right 모델의 여러 높이에서의 거리와
-        기울기 차이를 계산하고, 시간적 히스테리시스로 한 프레임의
-        오판정이 즉시 좌우 반전으로 이어지지 않게 한다.
-        """
-        if self.prev_lfit is None or self.prev_rfit is None:
-            self.single_left_score = float('inf')
-            self.single_right_score = float('inf')
-            return None, self.single_left_score, self.single_right_score
+        slope = float(fit[0])
+        self.single_lane_slope = slope
+        self.single_left_score = float('inf')
+        self.single_right_score = float('inf')
 
-        left_score = self.fit_distance(fit, self.prev_lfit, img_h)
-        right_score = self.fit_distance(fit, self.prev_rfit, img_h)
-
-        # 동일한 위치라도 기울기가 크게 다르면 같은 경계일 가능성을 낮춘다.
-        slope_weight = 0.20 * img_h
-        left_score += slope_weight * abs(fit[0] - self.prev_lfit[0])
-        right_score += slope_weight * abs(fit[0] - self.prev_rfit[0])
-
-        self.single_left_score = float(left_score)
-        self.single_right_score = float(right_score)
-
-        lane_width = max(abs(self.lane_width_px), 1.0)
-        match_gate = max(35.0, self.side_match_gate_ratio * lane_width)
-        hold_gate = max(match_gate, self.side_hold_gate_ratio * lane_width)
-        decision_margin = max(12.0, self.side_match_margin_ratio * lane_width)
-
-        best_score = min(left_score, right_score)
-        score_gap = abs(left_score - right_score)
-
-        if best_score > match_gate or score_gap < decision_margin:
-            raw_side = None
-        elif left_score < right_score:
-            raw_side = 'left'
+        if slope > 0.0:
+            side = 'right'
+        elif slope < 0.0:
+            side = 'left'
         else:
-            raw_side = 'right'
+            side = None
 
-        # 아직 단일 차선의 추적 ID가 없으면 강한 첫 판정을 그대로 사용한다.
-        if self.last_observed_side is None:
-            if raw_side is not None:
-                self.last_observed_side = raw_side
-                self.pending_single_side = None
-                self.pending_single_count = 0
-            return raw_side, left_score, right_score
-
-        current_side = self.last_observed_side
-        current_score = left_score if current_side == 'left' else right_score
-
-        # 애매한 프레임에서는 현재 추적 ID가 허용 거리 안에 있을 때 유지한다.
-        if raw_side is None:
-            self.pending_single_side = None
-            self.pending_single_count = 0
-            if current_score <= hold_gate:
-                return current_side, left_score, right_score
-            return None, left_score, right_score
-
-        # 기존 ID와 같은 판정이면 즉시 유지하고 전환 후보를 초기화한다.
-        if raw_side == current_side:
-            self.pending_single_side = None
-            self.pending_single_count = 0
-            return current_side, left_score, right_score
-
-        # 반대쪽 판정은 여러 프레임 연속 확인된 뒤에만 실제 ID를 변경한다.
-        if self.pending_single_side == raw_side:
-            self.pending_single_count += 1
-        else:
-            self.pending_single_side = raw_side
-            self.pending_single_count = 1
-
-        if self.pending_single_count >= self.side_switch_frames:
-            self.last_observed_side = raw_side
-            self.pending_single_side = None
-            self.pending_single_count = 0
-            return raw_side, left_score, right_score
-
-        # 전환 확인 중에는 기존 경계를 계속 추적한다. 기존 모델과 너무 멀면
-        # 억지로 사용하지 않고 ambiguous로 처리한다.
-        if current_score <= hold_gate:
-            return current_side, left_score, right_score
-        return None, left_score, right_score
+        self.last_observed_side = side
+        self.pending_single_side = None
+        self.pending_single_count = 0
+        return side, self.single_left_score, self.single_right_score
 
     def update_single_lane_track(self, observed_fit, side):
         """관측된 경계는 추적하고, 반대 경계만 고정 차선 폭으로 복원한다."""
@@ -366,12 +318,12 @@ class LaneFollow(Node):
     def roi_set(self, img):
         h = img.shape[0]
         w = img.shape[1]
-        return img[int(h*0.8):h, :]
+        return img[int(h*0.85):h, :]
 
     def cal_steering(self, yaw, error, gear=3):
         gear = self.gear
         
-        base_speed = 0.7
+        base_speed = 1.0
         wheelbase = 0.23
 
         # Stanley 제어기로 조향각 delta 계산
@@ -689,19 +641,18 @@ class LaneFollow(Node):
         )
         text2 = f'err: {self.error:.1f} px / v: {self.cmd_speed:.2f}'
         text3 = f'lane: {self.last_lane_status}'
-        if np.isfinite(self.single_left_score) and np.isfinite(self.single_right_score):
-            text4 = (
-                f'match L:{self.single_left_score:.1f} '
-                f'R:{self.single_right_score:.1f}'
-            )
+        if np.isfinite(self.single_lane_slope):
+            text4 = f'single slope: {self.single_lane_slope:.4f}'
         else:
-            text4 = 'match L:- R:-'
+            text4 = 'single slope: -'
         cv.putText(result, text1, (30, 40),
                    cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv.LINE_AA)
         cv.putText(result, text2, (30, 110),
                    cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv.LINE_AA)
         cv.putText(result, text3, (30, 145),
                    cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv.LINE_AA)
+        cv.putText(result, text4, (30, 180),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2, cv.LINE_AA)
 
         if self.debug_view:
             #cv.imshow('debug_warp', color_warp)
